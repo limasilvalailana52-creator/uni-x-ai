@@ -1,11 +1,11 @@
 import concurrent.futures
-from typing import Dict, List, Any
+from typing import Any, Dict, List
 
 import requests
 
 
 class UniXEngineHub:
-    """Executa motores configurados em paralelo e faz uma segunda etapa de revisão."""
+    """Executa motores configurados em paralelo e faz revisão cruzada com fallback."""
 
     def __init__(self, keys: Dict[str, str], models: Dict[str, str] | None = None):
         self.keys = {name: (value or "").strip() for name, value in keys.items()}
@@ -17,9 +17,8 @@ class UniXEngineHub:
         if not key:
             return {"engine": engine, "ok": False, "output": "Chave não configurada."}
 
-        model = self.models.get(engine) or (
-            "openai/gpt-oss-20b" if engine == "groq" else "openrouter/free"
-        )
+        default_model = "openai/gpt-oss-20b" if engine == "groq" else "openrouter/free"
+        model = self.models.get(engine) or default_model
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         if engine == "openrouter":
             headers["HTTP-Referer"] = "https://streamlit.app"
@@ -35,13 +34,18 @@ class UniXEngineHub:
         }
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
             if not response.ok:
-                message = data.get("error", {}).get("message", response.text[:500])
+                error = data.get("error", {}) if isinstance(data, dict) else {}
+                message = error.get("message") if isinstance(error, dict) else None
+                message = message or response.text[:500] or "Resposta de erro sem detalhes."
                 return {"engine": engine, "ok": False, "output": f"HTTP {response.status_code}: {message}"}
             content = data["choices"][0]["message"]["content"]
             return {"engine": engine, "ok": True, "output": content or "(Resposta vazia)"}
-        except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
             return {"engine": engine, "ok": False, "output": f"Falha na chamada: {exc}"}
 
     def _call_groq(self, prompt: str) -> Dict[str, Any]:
@@ -70,19 +74,19 @@ class UniXEngineHub:
             "generationConfig": {"temperature": 0.2},
         }
         try:
-            response = requests.post(
-                url,
-                params={"key": key},
-                json=payload,
-                timeout=self.timeout,
-            )
-            data = response.json()
+            response = requests.post(url, params={"key": key}, json=payload, timeout=self.timeout)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
             if not response.ok:
-                message = data.get("error", {}).get("message", response.text[:500])
+                error = data.get("error", {}) if isinstance(data, dict) else {}
+                message = error.get("message") if isinstance(error, dict) else None
+                message = message or response.text[:500] or "Resposta de erro sem detalhes."
                 return {"engine": "Gemini", "ok": False, "output": f"HTTP {response.status_code}: {message}"}
             text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return {"engine": "Gemini", "ok": True, "output": text}
-        except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+            return {"engine": "Gemini", "ok": True, "output": text or "(Resposta vazia)"}
+        except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
             return {"engine": "Gemini", "ok": False, "output": f"Falha na chamada: {exc}"}
 
     def processar_em_lote(self, prompt: str) -> List[Dict[str, Any]]:
@@ -93,16 +97,14 @@ class UniXEngineHub:
             jobs.append(self._call_gemini)
         if self.keys.get("openrouter"):
             jobs.append(self._call_openrouter)
-
         if not jobs:
             return []
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             futures = [pool.submit(job, prompt) for job in jobs]
             return [future.result() for future in futures]
 
     def validar_respostas(self, prompt: str, resultados: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Pede a um motor uma crítica independente e uma síntese baseada nas respostas."""
+        """Tenta revisar na ordem OpenRouter, Gemini e Groq, avançando se houver falha."""
         if not resultados:
             return {"engine": "Validador", "ok": False, "output": "Não há respostas para validar."}
 
@@ -127,15 +129,27 @@ ENTREGUE:
 5. Plano de ação em etapas.
 Não invente fatos. Diferencie o que foi verificado do que é hipótese. Responda em português.
 """
-        # Preferência para revisão: OpenRouter, depois Gemini, depois Groq.
+
+        candidates = []
         if self.keys.get("openrouter"):
-            validator = self._call_openrouter(validation_prompt)
-        elif self.keys.get("gemini"):
-            validator = self._call_gemini(validation_prompt)
-        elif self.keys.get("groq"):
-            validator = self._call_groq(validation_prompt)
-        else:
+            candidates.append(self._call_openrouter)
+        if self.keys.get("gemini"):
+            candidates.append(self._call_gemini)
+        if self.keys.get("groq"):
+            candidates.append(self._call_groq)
+        if not candidates:
             return {"engine": "Validador", "ok": False, "output": "Nenhuma chave disponível."}
 
-        validator["engine"] = f"Validador ({validator['engine']})"
-        return validator
+        failures = []
+        for call in candidates:
+            result = call(validation_prompt)
+            if result.get("ok"):
+                result["engine"] = f"Validador ({result.get('engine', 'motor')})"
+                return result
+            failures.append(f"{result.get('engine', 'Motor')}: {result.get('output', 'falha sem detalhes')}")
+
+        return {
+            "engine": "Validador",
+            "ok": False,
+            "output": "Todos os motores de validação falharam.\n" + "\n".join(failures),
+        }
